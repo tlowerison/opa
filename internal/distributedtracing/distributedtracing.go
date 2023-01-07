@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
@@ -53,45 +54,46 @@ func isSupportedSampleRatePercentage(sampleRate int) bool {
 }
 
 type distributedTracingConfig struct {
-	Type                  string `json:"type,omitempty"`
-	Address               string `json:"address,omitempty"`
-	ServiceName           string `json:"service_name,omitempty"`
-	SampleRatePercentage  *int   `json:"sample_percentage,omitempty"`
-	EncryptionScheme      string `json:"encryption,omitempty"`
-	EncryptionSkipVerify  *bool  `json:"allow_insecure_tls,omitempty"`
-	TLSCertFile           string `json:"tls_cert_file,omitempty"`
-	TLSCertPrivateKeyFile string `json:"tls_private_key_file,omitempty"`
-	TLSCACertFile         string `json:"tls_ca_cert_file,omitempty"`
+	Type                  string  `json:"type,omitempty"`
+	Address               string  `json:"address,omitempty"`
+	ServiceName           string  `json:"service_name,omitempty"`
+	SampleRatePercentage  *int    `json:"sample_percentage,omitempty"`
+	EncryptionScheme      string  `json:"encryption,omitempty"`
+	EncryptionSkipVerify  *bool   `json:"allow_insecure_tls,omitempty"`
+	TLSCertFile           string  `json:"tls_cert_file,omitempty"`
+	TLSCertPrivateKeyFile string  `json:"tls_private_key_file,omitempty"`
+	TLSCACertFile         string  `json:"tls_ca_cert_file,omitempty"`
+	Propagation           *string `json:"propagation,omitempty"`
 }
 
-func Init(ctx context.Context, raw []byte, id string) (*otlptrace.Exporter, *trace.TracerProvider, error) {
+func Init(ctx context.Context, raw []byte, id string) (*otlptrace.Exporter, *trace.TracerProvider, propagation.TextMapPropagator, error) {
 	parsedConfig, err := config.ParseConfig(raw, id)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	distributedTracingConfig, err := parseDistributedTracingConfig(parsedConfig.DistributedTracing)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	if strings.ToLower(distributedTracingConfig.Type) != "grpc" {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	certificate, err := loadCertificate(distributedTracingConfig.TLSCertFile, distributedTracingConfig.TLSCertPrivateKeyFile)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	certPool, err := loadCertPool(distributedTracingConfig.TLSCACertFile)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	tlsOption, err := tlsOption(distributedTracingConfig.EncryptionScheme, *distributedTracingConfig.EncryptionSkipVerify, certificate, certPool)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	traceExporter := otlptracegrpc.NewUnstarted(
@@ -99,13 +101,18 @@ func Init(ctx context.Context, raw []byte, id string) (*otlptrace.Exporter, *tra
 		tlsOption,
 	)
 
+	textMapPropagator, err := getTextMapPropagator(distributedTracingConfig.Propagation)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String(distributedTracingConfig.ServiceName),
 		),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	traceProvider := trace.NewTracerProvider(
@@ -114,12 +121,26 @@ func Init(ctx context.Context, raw []byte, id string) (*otlptrace.Exporter, *tra
 		trace.WithSpanProcessor(trace.NewBatchSpanProcessor(traceExporter)),
 	)
 
-	return traceExporter, traceProvider, nil
+	return traceExporter, traceProvider, textMapPropagator, nil
 }
 
 func SetupLogging(logger logging.Logger) {
 	otel.SetErrorHandler(&errorHandler{logger: logger})
 	otel.SetLogger(logr.New(&sink{logger: logger}))
+}
+
+func getTextMapPropagator(propagationMethod *string) (propagation.TextMapPropagator, error) {
+	if propagationMethod == nil {
+		return propagation.TraceContext{}, nil
+	}
+
+	if *propagationMethod == "baggage" {
+		return propagation.Baggage{}, nil
+	} else if *propagationMethod == "tracecontext" {
+		return propagation.TraceContext{}, nil
+	} else {
+		return nil, fmt.Errorf("unknown distributed_tracing.propagation '%s', must be empty, \"baggage\" or \"tracecontext\" (unset)", propagationMethod)
+	}
 }
 
 func parseDistributedTracingConfig(raw []byte) (*distributedTracingConfig, error) {
